@@ -12,6 +12,10 @@
  *   node tools/calc-exp-yield.js
  *   node tools/calc-exp-yield.js --lands 18 --level 27
  *   node tools/calc-exp-yield.js --input tools/seed-shop-merged-export.json
+ *
+ * 运行时调用：
+ *   const { getPlantingRecommendation } = require('../tools/calc-exp-yield');
+ *   const rec = getPlantingRecommendation(27, 18);
  */
 
 const fs = require('fs');
@@ -311,31 +315,34 @@ function writeSummaryTxt(outPath, opts, meta, topNo, topFert, levelInfo) {
     fs.writeFileSync(outPath, `${lines.join('\n')}\n`, 'utf8');
 }
 
-function main() {
-    const opts = parseArgs(process.argv.slice(2));
-    const inputAbs = path.resolve(opts.input);
+function analyzeExpYield(opts = {}) {
+    const lands = Math.max(1, Math.floor(toNum(opts.lands, 18)));
+    const level = opts.level == null ? null : Math.max(1, Math.floor(toNum(opts.level, 1)));
+    const top = Math.max(1, Math.floor(toNum(opts.top, 20)));
+    const input = opts.input || DEFAULT_INPUT;
+    const inputAbs = path.resolve(input);
     const rawSeeds = readSeeds(inputAbs);
     const seedPhaseReduceMap = loadSeedPhaseReduceMap();
-    const { rows, skipped, plantSecondsNoFert, plantSecondsNormalFert, missingPhaseReduceCount } = buildRows(rawSeeds, opts.lands, seedPhaseReduceMap);
+    const { rows, skipped, plantSecondsNoFert, plantSecondsNormalFert, missingPhaseReduceCount } = buildRows(rawSeeds, lands, seedPhaseReduceMap);
 
     if (rows.length === 0) {
         throw new Error('没有可计算的种子数据（请检查输入文件）');
     }
 
-    const topNo = pickTop(rows, 'farmExpPerHourNoFert', opts.top);
-    const topFert = pickTop(rows, 'farmExpPerHourNormalFert', opts.top);
+    const topNo = pickTop(rows, 'farmExpPerHourNoFert', top);
+    const topFert = pickTop(rows, 'farmExpPerHourNormalFert', top);
     const bestByLevel = buildBestByLevel(rows);
 
     let currentLevel = null;
-    if (opts.level != null) {
-        currentLevel = bestByLevel.find(x => x.level === opts.level) || null;
+    if (level != null) {
+        currentLevel = bestByLevel.find(x => x.level === level) || null;
     }
 
-    const payload = {
+    return {
         generatedAt: new Date().toISOString(),
         input: inputAbs,
         config: {
-            lands: opts.lands,
+            lands,
             plantSpeedPerSecNoFert: NO_FERT_PLANT_SPEED_PER_SEC,
             plantSpeedPerSecNormalFert: NORMAL_FERT_PLANT_SPEED_PER_SEC,
             plantSecondsNoFert,
@@ -370,19 +377,78 @@ function main() {
         currentLevel,
         rows,
     };
+}
+
+function getPlantingRecommendation(level, lands, opts = {}) {
+    const safeLevel = Math.max(1, Math.floor(toNum(level, 1)));
+    const payload = analyzeExpYield({
+        input: opts.input || DEFAULT_INPUT,
+        lands: lands == null ? 18 : lands,
+        top: opts.top || 20,
+        level: safeLevel,
+    });
+
+    const availableRows = payload.rows.filter(r => r.requiredLevel <= safeLevel);
+    const bestNoFertRow = pickTop(availableRows, 'farmExpPerHourNoFert', 1)[0] || null;
+    const bestNormalFertRow = pickTop(availableRows, 'farmExpPerHourNormalFert', 1)[0] || null;
+
+    return {
+        level: safeLevel,
+        lands: payload.config.lands,
+        input: payload.input,
+        bestNoFert: bestNoFertRow ? {
+            seedId: bestNoFertRow.seedId,
+            name: bestNoFertRow.name,
+            requiredLevel: bestNoFertRow.requiredLevel,
+            expPerHour: Number(bestNoFertRow.farmExpPerHourNoFert.toFixed(4)),
+        } : null,
+        bestNormalFert: bestNormalFertRow ? {
+            seedId: bestNormalFertRow.seedId,
+            name: bestNormalFertRow.name,
+            requiredLevel: bestNormalFertRow.requiredLevel,
+            expPerHour: Number(bestNormalFertRow.farmExpPerHourNormalFert.toFixed(4)),
+        } : null,
+        candidatesNoFert: pickTop(availableRows, 'farmExpPerHourNoFert', opts.top || 20).map(r => ({
+            seedId: r.seedId,
+            name: r.name,
+            requiredLevel: r.requiredLevel,
+            expPerHour: Number(r.farmExpPerHourNoFert.toFixed(4)),
+        })),
+        candidatesNormalFert: pickTop(availableRows, 'farmExpPerHourNormalFert', opts.top || 20).map(r => ({
+            seedId: r.seedId,
+            name: r.name,
+            requiredLevel: r.requiredLevel,
+            expPerHour: Number(r.farmExpPerHourNormalFert.toFixed(4)),
+            gainPercent: Number(r.gainPercent.toFixed(4)),
+        })),
+    };
+}
+
+function main() {
+    const opts = parseArgs(process.argv.slice(2));
+    const payload = analyzeExpYield(opts);
+    const rows = payload.rows;
+    const topNo = pickTop(rows, 'farmExpPerHourNoFert', opts.top);
+    const topFert = pickTop(rows, 'farmExpPerHourNormalFert', opts.top);
+    const currentLevel = payload.currentLevel;
 
     writeJson(path.resolve(opts.outJson), payload);
     writeCsv(path.resolve(opts.outCsv), rows);
     writeSummaryTxt(
         path.resolve(opts.outTxt),
         opts,
-        { input: inputAbs, plantSecondsNoFert, plantSecondsNormalFert, missingPhaseReduceCount },
+        {
+            input: payload.input,
+            plantSecondsNoFert: payload.config.plantSecondsNoFert,
+            plantSecondsNormalFert: payload.config.plantSecondsNormalFert,
+            missingPhaseReduceCount: payload.stats.missingPhaseReduceCount,
+        },
         topNo,
         topFert,
         currentLevel
     );
 
-    console.log(`[收益率] 计算完成，共 ${rows.length} 条（跳过 ${skipped} 条）`);
+    console.log(`[收益率] 计算完成，共 ${rows.length} 条（跳过 ${payload.stats.skippedCount} 条）`);
     console.log(`[收益率] JSON: ${path.resolve(opts.outJson)}`);
     console.log(`[收益率] CSV : ${path.resolve(opts.outCsv)}`);
     console.log(`[收益率] TXT : ${path.resolve(opts.outTxt)}`);
@@ -392,9 +458,17 @@ function main() {
     }
 }
 
-try {
-    main();
-} catch (e) {
-    console.error(`[收益率] 失败: ${e.message}`);
-    process.exit(1);
+module.exports = {
+    analyzeExpYield,
+    getPlantingRecommendation,
+    DEFAULT_INPUT,
+};
+
+if (require.main === module) {
+    try {
+        main();
+    } catch (e) {
+        console.error(`[收益率] 失败: ${e.message}`);
+        process.exit(1);
+    }
 }
